@@ -7,7 +7,13 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.projection.MediaProjectionManager;
+import android.os.Build;
+import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -38,6 +44,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
@@ -73,6 +80,12 @@ public class MainActivity extends Activity {
     static final float[] PPITCH = {0.85f, 1.25f, 0.65f, 1.10f, 0.75f, 1.00f};
     static final float[] PRATE = {1.00f, 1.02f, 0.95f, 1.10f, 0.88f, 1.12f};
 
+    // Remote Play modunda konuşanın ses perdesine göre sabit karakter sesleri
+    static final String[] BNAME = {"Kalın sesli erkek", "Erkek karakter", "Genç erkek", "Kadın karakter", "Genç kadın", "İnce ses"};
+    static final float[] BPITCH = {0.70f, 0.85f, 1.00f, 1.20f, 1.35f, 1.50f};
+    static final float[] BRATE = {0.95f, 1.00f, 1.08f, 1.02f, 1.08f, 1.10f};
+    static final int REQ_PROJECTION = 7;
+
     SharedPreferences prefs;
     AudioManager am;
     SpeechRecognizer sr;
@@ -92,7 +105,9 @@ public class MainActivity extends Activity {
     LinearLayout big, settingsBox;
     Button startBtn;
     Spinner langSp, voiceSp;
-    Switch ttsSw, npcSw, hpSw, skipSw;
+    Switch ttsSw, npcSw, hpSw, skipSw, remoteSw;
+    ParcelFileDescriptor readFd;
+    boolean triedProjection = false;
     SeekBar rateSb, volSb;
 
     final Runnable restartRunnable = this::startListening;
@@ -110,6 +125,10 @@ public class MainActivity extends Activity {
         tts = new TextToSpeech(this, status -> h.post(() -> {
             if (status == TextToSpeech.SUCCESS) {
                 int r = tts.setLanguage(new Locale("tr", "TR"));
+                tts.setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build());
                 ttsReady = true;
                 if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
                     showErr("Türkçe ses yüklü değil. Ayarlar > Metin okuma çıkışı > Google > Ses verilerini yükle > Türkçe.");
@@ -123,7 +142,7 @@ public class MainActivity extends Activity {
             @Override
             public void onStart(String id) {
                 h.post(() -> {
-                    if (running && !hpSw.isChecked()) {
+                    if (running && !noEchoRisk()) {
                         pauseListening();
                         setStatus("Türkçe okunuyor…");
                     }
@@ -168,22 +187,64 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
         super.onRequestPermissionsResult(code, perms, res);
-        if (res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED) startAll();
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) startAll();
         else showErr("Mikrofon izni verilmedi. Ayarlar > Uygulamalar > Oyun Çevirmen > İzinler'den mikrofona izin verin.");
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req != REQ_PROJECTION) return;
+        if (res == RESULT_OK && data != null) {
+            Intent s = new Intent(this, CaptureService.class)
+                    .putExtra("code", res)
+                    .putExtra("data", data);
+            startForegroundService(s);
+            setStatus("Remote Play sesine bağlanıyor…");
+            h.postDelayed(this::startAll, 800);
+        } else {
+            showErr("Ses paylaşım izni verilmedi. Mikrofon moduyla devam ediliyor.");
+            startAll();
+        }
+    }
+
+    boolean remoteActive() {
+        return remoteSw != null && remoteSw.isChecked() && CaptureService.inst != null && Build.VERSION.SDK_INT >= 33;
+    }
+
+    boolean noEchoRisk() {
+        return hpSw.isChecked() || remoteActive();
     }
 
     // ------------------------------------------------------------ başlat / durdur
 
     void startAll() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+            if (Build.VERSION.SDK_INT >= 33) {
+                requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS}, 1);
+            } else {
+                requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+            }
             return;
+        }
+        if (remoteSw.isChecked() && CaptureService.inst == null) {
+            if (Build.VERSION.SDK_INT < 33) {
+                showErr("Remote Play'den doğrudan ses almak Android 13 ve üstünü gerektirir. Mikrofon moduyla devam ediliyor.");
+            } else if (!triedProjection) {
+                triedProjection = true;
+                MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
+                startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION);
+                return;
+            } else {
+                showErr("Remote Play sesi alınamadı. Mikrofon moduyla devam ediliyor.");
+            }
         }
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             showErr("Bu telefonda konuşma tanıma servisi yok. Play Store'dan Google uygulamasını yükleyin / güncelleyin.");
             return;
         }
-        showErr("");
+        if (!remoteSw.isChecked() || CaptureService.inst != null) showErr("");
         running = true;
         npcIdx = 0;
         lastFinal = "";
@@ -202,6 +263,9 @@ public class MainActivity extends Activity {
         }
         if (tts != null) tts.stop();
         pending = 0;
+        triedProjection = false;
+        closePipe();
+        try { stopService(new Intent(this, CaptureService.class)); } catch (Exception ignored) { }
         if (startBtn != null) {
             startBtn.setText("▶ Başlat");
             startBtn.setBackgroundColor(0xFFFF4FA3);
@@ -212,6 +276,14 @@ public class MainActivity extends Activity {
     }
 
     boolean beepsMuted = false;
+
+    void closePipe() {
+        OutputStream s = CaptureService.sink;
+        CaptureService.sink = null;
+        try { if (s != null) s.close(); } catch (IOException ignored) { }
+        try { if (readFd != null) readFd.close(); } catch (IOException ignored) { }
+        readFd = null;
+    }
 
     void muteBeeps(boolean m) {
         if (m == beepsMuted) return;
@@ -257,6 +329,12 @@ public class MainActivity extends Activity {
             if (e == SpeechRecognizer.ERROR_NETWORK || e == SpeechRecognizer.ERROR_NETWORK_TIMEOUT) {
                 showErr("İnternet bağlantısı gerekiyor.");
             }
+            if (e == 13 && Build.VERSION.SDK_INT >= 33) { // ERROR_LANGUAGE_UNAVAILABLE
+                showErr("Telefonda bu dilin konuşma tanıma paketi yok, indiriliyor. Bitince tekrar Başlat'a basın.");
+                try { if (sr != null) sr.triggerModelDownload(buildIntent()); } catch (Exception ignored) { }
+                stopAll();
+                return;
+            }
             if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || e == SpeechRecognizer.ERROR_CLIENT) {
                 try { if (sr != null) sr.destroy(); } catch (Exception ignored) { }
                 sr = null;
@@ -268,7 +346,7 @@ public class MainActivity extends Activity {
     };
 
     void next(long ms) {
-        if (running && (hpSw.isChecked() || pending == 0)) restartSoon(ms);
+        if (running && (noEchoRisk() || pending == 0)) restartSoon(ms);
     }
 
     void restartSoon(long ms) {
@@ -276,22 +354,59 @@ public class MainActivity extends Activity {
         h.postDelayed(restartRunnable, ms);
     }
 
+    boolean srOnDevice = false;
+
+    Intent buildIntent() {
+        String lang = LANGS[Math.max(0, langSp.getSelectedItemPosition())][0];
+        Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang);
+        return i;
+    }
+
     void startListening() {
         if (!running) return;
+        boolean remote = remoteActive();
+        boolean wantOnDevice = remote && Build.VERSION.SDK_INT >= 33
+                && SpeechRecognizer.isOnDeviceRecognitionAvailable(this);
+        if (sr != null && srOnDevice != wantOnDevice) {
+            try { sr.destroy(); } catch (Exception ignored) { }
+            sr = null;
+        }
         if (sr == null) {
-            sr = SpeechRecognizer.createSpeechRecognizer(this);
+            sr = wantOnDevice
+                    ? SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+                    : SpeechRecognizer.createSpeechRecognizer(this);
+            srOnDevice = wantOnDevice;
             sr.setRecognitionListener(listener);
+        }
+        if (remote && SystemClock.elapsedRealtime() - CaptureService.lastLoudMs > 20000) {
+            showErr("Remote Play'den ses gelmiyor. Remote Play açık ve oyun sesi geliyor mu kontrol edin. Hâlâ gelmiyorsa Remote Play sesin alınmasına izin vermiyor demektir; ayarlardan Remote Play modunu kapatıp mikrofonla kullanın.");
         }
         String lang = LANGS[Math.max(0, langSp.getSelectedItemPosition())][0];
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        if (remote) {
+            try {
+                closePipe();
+                ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+                readFd = pipe[0];
+                CaptureService.sink = new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]);
+                i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, readFd);
+                i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1);
+                i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT);
+                i.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, CaptureService.RATE);
+            } catch (IOException ex) {
+                showErr("Remote Play sesi bağlanamadı, mikrofon kullanılıyor.");
+            }
+        }
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang);
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
         i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
-        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
-        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 600L);
+        i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 600L);
         listening = true;
         try {
             sr.startListening(i);
@@ -315,6 +430,7 @@ public class MainActivity extends Activity {
         final String src = raw.trim();
         if (src.length() < 2 || src.equals(lastFinal)) return;
         lastFinal = src;
+        final float f0 = remoteActive() ? CaptureService.recentPitch() : 0f;
         String code = LANGS[Math.max(0, langSp.getSelectedItemPosition())][0];
         final String sl = code.startsWith("zh") ? "zh-CN" : code.substring(0, 2);
         net.execute(() -> {
@@ -327,7 +443,7 @@ public class MainActivity extends Activity {
                 showErr("");
                 trLine.setText(tr);
                 srcLine.setText(src);
-                String tag = speak(tr);
+                String tag = speak(tr, f0);
                 addLog(tag, tr, src);
             });
         });
@@ -422,6 +538,10 @@ public class MainActivity extends Activity {
     }
 
     String speak(String text) {
+        return speak(text, 0f);
+    }
+
+    String speak(String text, float f0) {
         if (!ttsSw.isChecked() || !ttsReady) return "Altyazı";
         if (skipSw.isChecked() && pending >= 2) {
             tts.stop();
@@ -431,7 +551,13 @@ public class MainActivity extends Activity {
         float vol = 0.2f + volSb.getProgress() / 100f;
         float pitch = 1f, rate = base;
         String tag = "Anlatıcı";
-        if (npcSw.isChecked()) {
+        if (npcSw.isChecked() && f0 > 0) {
+            int k = f0 < 110 ? 0 : f0 < 140 ? 1 : f0 < 165 ? 2 : f0 < 200 ? 3 : f0 < 240 ? 4 : 5;
+            pitch = BPITCH[k];
+            rate = base * BRATE[k];
+            tag = BNAME[k];
+            if (!trVoices.isEmpty()) tts.setVoice(trVoices.get(k % trVoices.size()));
+        } else if (npcSw.isChecked()) {
             int k = npcIdx % PNAME.length;
             pitch = PPITCH[k];
             rate = base * PRATE[k];
@@ -626,7 +752,7 @@ public class MainActivity extends Activity {
         });
         settingsBox.addView(voiceSp);
         label("Konuşma hızı");
-        rateSb = sb(90, "rate", 40);
+        rateSb = sb(90, "rate2", 55);
         label("Ses düzeyi");
         volSb = sb(80, "vol", 80);
         hpSw = sw("Kulaklık takıyorum (yankı korumasını kapat)", false, "hp");
@@ -634,6 +760,12 @@ public class MainActivity extends Activity {
         TextView hint = tv("Karakter modunda her replik farklı ton ve hızla okunur (ana karakter, kadın, sert NPC, genç, yaşlı, polis telsizi). Telefonda ne kadar çok Türkçe ses yüklüyse çeşitlilik o kadar artar.", 13, 0xFF8B93A7, false);
         hint.setPadding(0, dp(6), 0, 0);
         settingsBox.addView(hint);
+
+        section("PS REMOTE PLAY BAĞLANTISI (DENEYSEL)");
+        remoteSw = sw("Remote Play sesini doğrudan dinle (Android 13+)", false, "remote");
+        TextView rh = tv("Açıkken uygulama, telefondaki PS Remote Play'in sesini mikrofon yerine doğrudan alır: oda gürültüsü karışmaz, kadın/erkek sesi ayırt edilip her konuşana sabit bir Türkçe ses verilir. Başlat'a basın, çıkan paylaşım iznini verin, sonra Remote Play'i açıp oynayın. Remote Play bu izni vermezse uygulama uyarır; o zaman bu ayarı kapatıp mikrofonla kullanın.", 13, 0xFF8B93A7, false);
+        rh.setPadding(0, dp(6), 0, 0);
+        settingsBox.addView(rh);
 
         section("SON REPLİKLER");
         logTv = tv("Henüz bir şey yok.", 14, 0xFFEEF1F6, false);
