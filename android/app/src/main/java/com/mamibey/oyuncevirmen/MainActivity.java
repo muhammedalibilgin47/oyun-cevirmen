@@ -108,6 +108,31 @@ public class MainActivity extends Activity {
     Switch ttsSw, npcSw, hpSw, skipSw, remoteSw;
     ParcelFileDescriptor readFd;
     boolean triedProjection = false;
+    boolean remoteFailed = false;
+    long lastRecogMs = 0, remoteSince = 0;
+
+    // Her saniye durum satırını güncelle; Remote Play sesi geliyor ama tanınmıyorsa mikrofona geç
+    final Runnable tick = new Runnable() {
+        @Override
+        public void run() {
+            if (!running) return;
+            long now = SystemClock.elapsedRealtime();
+            if (remoteActive()) {
+                boolean loud = now - CaptureService.lastLoudMs < 1500;
+                if (loud && now - lastRecogMs > 12000 && now - remoteSince > 12000) {
+                    remoteFailed = true;
+                    closePipe();
+                    try { stopService(new Intent(MainActivity.this, CaptureService.class)); } catch (Exception ignored) { }
+                    showErr("Telefonun konuşma tanıması Remote Play sesini doğrudan alamıyor. Otomatik olarak mikrofon moduna geçildi: telefonu TV / monitör hoparlörüne yakın tutun.");
+                    pauseListening();
+                    restartSoon(300);
+                } else if (listening) {
+                    statusTv.setText("Dinliyor… (Remote Play sesi: " + (loud ? "geliyor ✓" : "sessiz") + ")");
+                }
+            }
+            h.postDelayed(this, 1000);
+        }
+    };
     SeekBar rateSb, volSb;
 
     final Runnable restartRunnable = this::startListening;
@@ -210,7 +235,7 @@ public class MainActivity extends Activity {
     }
 
     boolean remoteActive() {
-        return remoteSw != null && remoteSw.isChecked() && CaptureService.inst != null && Build.VERSION.SDK_INT >= 33;
+        return !remoteFailed && remoteSw != null && remoteSw.isChecked() && CaptureService.inst != null && Build.VERSION.SDK_INT >= 33;
     }
 
     boolean noEchoRisk() {
@@ -248,6 +273,12 @@ public class MainActivity extends Activity {
         running = true;
         npcIdx = 0;
         lastFinal = "";
+        lastRecogMs = SystemClock.elapsedRealtime();
+        remoteSince = lastRecogMs;
+        trLine.setText("Dinliyorum… Oyunda biri konuşunca Türkçesi burada çıkacak.");
+        srcLine.setText("");
+        h.removeCallbacks(tick);
+        h.postDelayed(tick, 1000);
         startBtn.setText("■ Durdur");
         startBtn.setBackgroundColor(0xFFC0392B);
         muteBeeps(true);
@@ -264,6 +295,8 @@ public class MainActivity extends Activity {
         if (tts != null) tts.stop();
         pending = 0;
         triedProjection = false;
+        remoteFailed = false;
+        h.removeCallbacks(tick);
         closePipe();
         try { stopService(new Intent(this, CaptureService.class)); } catch (Exception ignored) { }
         if (startBtn != null) {
@@ -308,14 +341,20 @@ public class MainActivity extends Activity {
         @Override
         public void onPartialResults(Bundle p) {
             ArrayList<String> r = p.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-            if (r != null && !r.isEmpty()) interimTv.setText(r.get(0));
+            if (r != null && !r.isEmpty()) {
+                interimTv.setText(r.get(0));
+                if (!r.get(0).trim().isEmpty()) lastRecogMs = SystemClock.elapsedRealtime();
+            }
         }
 
         @Override
         public void onResults(Bundle p) {
             ArrayList<String> r = p.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
             interimTv.setText("");
-            if (r != null && !r.isEmpty()) handleFinal(r.get(0));
+            if (r != null && !r.isEmpty()) {
+                lastRecogMs = SystemClock.elapsedRealtime();
+                handleFinal(r.get(0));
+            }
             next(100);
         }
 
