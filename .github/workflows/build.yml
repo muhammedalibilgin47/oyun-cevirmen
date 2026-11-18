@@ -2,6 +2,9 @@ name: IPA Olustur
 
 on:
   push:
+    paths:
+      - 'OyunCevirmen/**'
+      - 'project.yml'
   workflow_dispatch:
 
 jobs:
